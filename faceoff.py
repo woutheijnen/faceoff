@@ -13,8 +13,10 @@ import concurrent.futures
 
 class FaceOff:
 
-    image_file_types = ('.jpg', '.jpeg', '.png', '.gif')
+    # Only jpg, else I get too many garbage images
+    image_file_types = ('.jpg', '.jpeg')
     image_files = []
+    substractPath = '/mnt/8ac50e64-6998-4105-ab73-614e1ac8481c/Syncthing/Pixel XX/'
 
     def __init__(self, _options):
         self.source_directory = os.path.abspath(_options.source)
@@ -22,7 +24,8 @@ class FaceOff:
             print('ERROR: source directory must exist')
             sys.exit(1)
 
-        if not any(filename.endswith(self.image_file_types) for filename in os.listdir(self.source_directory)):
+        # Ugly and not a really good fix to still scan if the root folder doesn't have images, because subfolders can have them
+        if not any(filename.endswith(self.image_file_types) for filename in os.listdir(self.source_directory)) and not _options.recursive:
             print('ERROR: source directory must contain image files')
             sys.exit(1)
 
@@ -51,7 +54,12 @@ class FaceOff:
         else:
             self.processed_face_directories = []
 
-        self.face_counter = len(self.processed_face_encodings)
+        # Keep track of processed files so a rerun doesn't reanalyse everything
+        if os.path.exists('./face_processed_files.pkl') and not self.alone:
+            with open('face_processed_files.pkl', 'rb') as input_file:
+                self.processed_files = pickle.load(input_file)
+        else:
+            self.processed_files = []
 
     def process_image(self, file):
         print(f'Started processing {file}...')
@@ -64,19 +72,23 @@ class FaceOff:
 
         except Exception as err:
             print('ERROR: %s' % err)
+            with open('/home/wout/.latest_faceoff_error.pkl', 'wb') as output_file:
+                pickle.dump(err, output_file, pickle.HIGHEST_PROTOCOL)
 
     def run(self, _options):
         if _options.recursive:
             for root, directories, files in os.walk(self.source_directory):
                 for file in files:
-                    if file.endswith(self.image_file_types):
-                        self.image_files.append(os.path.join(root, file))
+                    path = os.path.join(root, file)
+                    if file.endswith(self.image_file_types) and path[len(self.substractPath):] not in self.processed_files:
+                        self.image_files.append(path)
         else:
             for file in os.listdir(self.source_directory):
-                if file.endswith(self.image_file_types):
-                    self.image_files.append(os.path.join(self.source_directory, file))
+                path = os.path.join(self.source_directory, file)
+                if file.endswith(self.image_file_types) and path[len(self.substractPath):] not in self.processed_files:
+                    self.image_files.append(path)
 
-        with concurrent.futures.ProcessPoolExecutor() as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=2) as executor:
             print('Running jobs...')
             results = executor.map(self.process_image, self.image_files)
 
@@ -89,24 +101,32 @@ class FaceOff:
                     for face_encoding in face_encodings:
                         matches = fr.compare_faces(self.processed_face_encodings, face_encoding)
                         if True in matches:
-                            match_index = matches.index(True)
-                            face_id = self.processed_face_directories[match_index]
+                            # Fixes in case face encoding matches multiple faces
+                            for match_index in range(len(matches)):
+                                if matches[match_index] == True:
+                                    face_id = self.processed_face_directories[match_index]
+                                    if not os.path.exists(os.path.join(self.target_directory, face_id)):
+                                        os.mkdir(os.path.join(self.target_directory, face_id))
+                                    # Fix copy file asap here or else it probably gets lost
+                                    shutil.copyfile(file, os.path.join(self.target_directory, face_id, os.path.basename(file)))
                         else:
-                            self.face_counter += 1
-                            face_id = 'face%d' % self.face_counter
+                            face_id = 'face%d' % (len(self.processed_face_encodings) + 1)
                             if not os.path.exists(os.path.join(self.target_directory, face_id)):
                                 os.mkdir(os.path.join(self.target_directory, face_id))
-                        self.processed_face_encodings.append(face_encoding)
-                        self.processed_face_directories.append(face_id)
+                            self.processed_face_encodings.append(face_encoding)
+                            self.processed_face_directories.append(face_id)
+                            shutil.copyfile(file, os.path.join(self.target_directory, face_id, os.path.basename(file)))
 
-                        shutil.copyfile(file, os.path.join(self.target_directory, face_id, os.path.basename(file)))
-
-        if not self.alone:
-            with open('face_encodings.pkl', 'wb') as output_file:
-                pickle.dump(self.processed_face_encodings, output_file, pickle.HIGHEST_PROTOCOL)
-
-            with open('face_directories.pkl', 'wb') as output_file:
-                pickle.dump(self.processed_face_directories, output_file, pickle.HIGHEST_PROTOCOL)
+                path = os.path.dirname(file) + '/' + os.path.basename(file)
+                self.processed_files.append(path[len(self.substractPath):])
+                # Write asap pkl data files in case analysis gets aborted it can rerun
+                if not self.alone:
+                    with open('face_encodings.pkl', 'wb') as output_file:
+                        pickle.dump(self.processed_face_encodings, output_file, pickle.HIGHEST_PROTOCOL)
+                    with open('face_directories.pkl', 'wb') as output_file:
+                        pickle.dump(self.processed_face_directories, output_file, pickle.HIGHEST_PROTOCOL)
+                    with open('face_processed_files.pkl', 'wb') as output_file:
+                        pickle.dump(self.processed_files, output_file, pickle.HIGHEST_PROTOCOL)
 
 
 def exit_gracefully(_signal, _frame):
